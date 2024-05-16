@@ -1,0 +1,1635 @@
+---
+title: "Cysteine S-acetylation is a post-translational modification involved in metabolic
+  regulation"
+author: "Akshay Bareja"
+date: "2024-05-16"
+output: html_document
+output: 
+  html_document:
+    code_folding: hide
+    toc: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(readxl)
+library(quantro)
+library(pheatmap)
+library(ggrepel)
+library(FactoMineR)
+library(factoextra)
+library(limma)
+library(org.Mm.eg.db)
+library(fgsea)
+library(VennDiagram)
+```
+
+### Helper function
+
+```{r message = FALSE, warning = FALSE}
+heatmap_function <- function(df, 
+                         cols, 
+                         log_transform,
+                         cluster_number,
+                         distance_metric_row,
+                         distance_metric_col,
+                         cluster_cols = TRUE,
+                         agglomeration_method,
+                         sample){
+  df_select <- df %>% 
+    dplyr::select(unique_id, all_of(cols)) %>% 
+    tidyr::drop_na() # remove all NAs
+  
+  highest_variance <- df_select %>% 
+    dplyr::rowwise() %>% 
+    dplyr::mutate(variance = var(c_across(starts_with("Abundance")))) %>% 
+    dplyr::ungroup() %>% 
+    dplyr::arrange(desc(variance)) %>% 
+    dplyr::slice(1L) %>% 
+    dplyr::pull(unique_id)
+  
+  lowest_variance <- df_select %>% 
+    dplyr::rowwise() %>% 
+    dplyr::mutate(variance = var(c_across(starts_with("Abundance")))) %>% 
+    dplyr::ungroup() %>% 
+    dplyr::arrange(variance) %>% 
+    dplyr::slice(1L) %>% 
+    dplyr::pull(unique_id)
+  
+  # convert to matrix
+  df_mat <- as.matrix(df_select[, -1])
+  
+  # optional log transform
+  if(log_transform){
+    df_mat <- apply(df_mat, 2, log2)
+  }
+  
+  # scale data
+  df_scaled <- t(scale(t(df_mat))) %>% 
+                  data.frame()
+  df_mat_scaled <- df_scaled %>% 
+                    tidyr::drop_na() %>% # because the dist() function below does not tolerate NAs or NaN. drop_na() gets rid of both!
+                    as.matrix()
+
+  # create column annotations
+  my_sample_col <- data.frame(
+    sample
+  )
+  
+  # add sample names as rownames
+  rownames(my_sample_col) <- colnames(df_mat_scaled)
+  
+  pheatmap(df_mat_scaled,
+           annotation_col = my_sample_col,
+           cutree_rows = cluster_number,
+           clustering_distance_rows = distance_metric_row,
+           clustering_distance_cols = distance_metric_col,
+           clustering_method = agglomeration_method,
+           cluster_cols = cluster_cols,
+           show_rownames = FALSE,
+           show_colnames = FALSE, 
+           main = paste0("Splitting Analytes into ", cluster_number," clusters"))
+  
+  my_results <- list("df_mat_scaled" = df_mat_scaled,
+                     "highest_variance" = highest_variance, 
+                     "lowest_variance" = lowest_variance)
+  #return(my_results) 
+}
+
+# Example use
+# a <- heatmap_function(df = all_acetyl_cys_peptide, cols = c(24:29), log_transform = FALSE, cluster_number = 6, distance_metric_row = "euclidean",distance_metric_col = "euclidean", agglomeration_method = "complete", sample = c("Liver", "Lung", "Kidney", "Skm", "Fr_liver", "Fr_BAT"))
+```
+
+## Figures 2 and S1
+
+Analysis of the cysteine acetylome following subcellular fractionation of mouse liver into cytoplasmic, mitochondrial, and nuclear fractions. 
+
+Volcano plots showing proteins and sites with the greatest differences in modification level between subcellular compartments.  
+
+### Import data
+
+```{r message = FALSE, warning = FALSE}
+# import peptide-level data
+subcell_peptide <- read_excel("Proteomics Data/All Acetyl-Cys Peptide groups _ all columns _ 20230330EKK20230327_LiverCellFrac_PD20230403.xlsx")
+
+# Add a unique identifier to each row
+subcell_peptide$peptide_id <- paste0("analyte_", 1:nrow(subcell_peptide))
+
+# import protein-level data
+subcell_protein <- read_excel("Protein data/All Proteins _ all columns _ 20230330EKK20230327_LiverCellFrac_PD20230403.xlsx")
+
+# In the case of peptide-level data, there are some peptides that match to MULTIPLE proteins
+# Decision - treat these as DIFFERENT peptides
+
+# select relevant columns 
+subcell_peptide <- subcell_peptide %>% 
+                            dplyr::select(peptide_id, `Master Protein Accessions`, starts_with("Abundances (Normalized)")) %>% 
+                            tidyr::drop_na()
+
+# reshape data frame
+subcell_peptide_long <- subcell_peptide %>%
+  tidyr::separate_longer_delim(`Master Protein Accessions`,
+                               delim = ";") %>%
+  tidyr::pivot_longer(
+    cols = starts_with("Abundance"),
+    names_to = "sample_name",
+    values_to = "peptide_value"
+  ) %>%
+  dplyr::rename(Accession = `Master Protein Accessions`) %>%
+  dplyr::mutate(Accession = str_trim(Accession))
+# select relevant columns
+subcell_protein <- subcell_protein %>% 
+                            dplyr::select(Accession, starts_with("Abundances (Normalized)")) %>% 
+                            tidyr::drop_na()
+
+# reshape data frame
+subcell_protein_long <- subcell_protein %>% 
+  tidyr::pivot_longer(cols = starts_with("Abundance"),
+                      names_to = "sample_name",
+                      values_to = "protein_value") 
+
+# join data frames, normalize peptide value, and reshape
+subcell_peptide_norm <- subcell_peptide_long %>% 
+  dplyr::inner_join(subcell_protein_long,
+                    by = c("Accession", "sample_name")) %>% 
+  dplyr::mutate(normalized_value = peptide_value/protein_value,
+                   .keep = "unused") %>% 
+  tidyr::pivot_wider(
+    names_from = sample_name,
+    values_from = normalized_value
+  ) %>% 
+  tidyr::unite("unique_id", peptide_id:Accession) # this way every entry will be unique
+
+# Note that these are a few analytes that have 1s across all samples, indicating that in these cases the peptide and protein abundance are IDENTICAL
+ 
+# create a column called `zero_var` that identifies those rows with 0 variance i.e. all 1s
+subcell_peptide_norm <- subcell_peptide_norm %>% 
+                                  dplyr::mutate(zero_var = if_all(starts_with("Abundances"), ~ . == 1))
+
+subcell_peptide_norm_var <- subcell_peptide_norm %>% 
+                                    dplyr::filter(!zero_var) %>% 
+                                    dplyr::select(-zero_var)
+subcell_peptide_norm_no_var <- subcell_peptide_norm %>% 
+                                        dplyr::filter(zero_var) %>% 
+                                        dplyr::select(-zero_var)
+
+subcell_peptide_only <- subcell_peptide %>% 
+  tidyr::separate_rows(`Master Protein Accessions`, sep = ";") %>% 
+  tidyr::unite("unique_id", peptide_id:`Master Protein Accessions`) %>% 
+  dplyr::filter(unique_id %in% subcell_peptide_norm_no_var$unique_id)
+
+# combine data frames
+# NOTE: treat separately for limma!
+subcell_peptide_norm <- dplyr::bind_rows(subcell_peptide_norm_var,
+                                               subcell_peptide_only)
+```
+
+### Heatmap
+
+```{r message = FALSE, warning = FALSE}
+heatmap_function(df = subcell_peptide_norm,
+                 cols = c(2:10),
+                 log_transform = FALSE,
+                 cluster_number = 6, 
+                 distance_metric_row = "correlation", 
+                 distance_metric_col = "correlation", 
+                 agglomeration_method = "average",
+                 sample = c(rep("Cyto", 3), rep("Mito", 3), rep("Nuc", 3)))
+```
+
+### PCA 
+
+```{r message = FALSE, warning = FALSE}
+subcell_peptide_pca_norm <- subcell_peptide_norm[2:10] %>% 
+                                  tidyr::drop_na() %>% 
+                                  as.matrix()
+subcell_peptide_pca_norm <- t(subcell_peptide_pca_norm)
+rownames(subcell_peptide_pca_norm) <- c(rep("Cyto", 3), rep("Mito", 3), rep("Nuc", 3))
+subcell_peptide_res.pca_norm <- PCA(subcell_peptide_pca_norm,  graph = FALSE)
+
+# Visualize eigenvalues/variances
+fviz_screeplot(subcell_peptide_res.pca_norm, addlabels = TRUE, ylim = c(0, 50))
+
+fviz_pca_ind(subcell_peptide_res.pca_norm, 
+             habillage = as.factor(rownames(subcell_peptide_pca_norm)),
+             repel = TRUE # Avoid text overlapping (slow if many points)
+             )
+```
+
+### Differential Abundance Analysis
+
+```{r message = FALSE, warning = FALSE}
+# first on set normalized to protein levels
+# prepare matrix for limma and log2 transform
+subcell_peptide_norm_var_mat <- as.matrix(subcell_peptide_norm_var[ , -c(1, 11, 12)])
+subcell_peptide_norm_var_mat <- apply(subcell_peptide_norm_var_mat, 2, log2)
+rownames(subcell_peptide_norm_var_mat) <- subcell_peptide_norm_var$unique_id
+
+# create design matrix
+subcell_group <- c(rep("Cyto", 3), rep("Mito", 3), rep("Nuc", 3))
+subcell_group <- factor(subcell_group,
+                                levels = c("Cyto", "Mito", "Nuc"))
+subcell_design <- model.matrix(~0 + subcell_group)
+colnames(subcell_design) <- c("Cyto_mean", "Mito_mean", "Nuc_mean")
+cell_identity <- rep(c(1, 2, 3), 3)
+
+cor_var <- duplicateCorrelation(subcell_peptide_norm_var_mat, 
+                            subcell_design, 
+                            block = cell_identity)
+# cor_var$consensus.correlation
+#-0.01765019
+
+# fit model
+subcell_var_fit <- limma::lmFit(subcell_peptide_norm_var_mat, 
+                                subcell_design,
+                                block = cell_identity,
+                                correlation=cor_var$consensus.correlation)
+
+# fit contrasts
+subcell.cont <- makeContrasts(
+  Mito_v_Cyto = Mito_mean - Cyto_mean,
+  Nuc_v_Cyto = Nuc_mean - Cyto_mean,
+  Nuc_v_Mito = Nuc_mean - Mito_mean,
+  levels = subcell_design
+)
+subcell_var_fit_cont <- contrasts.fit(subcell_var_fit, subcell.cont)
+
+subcell_var_efit <- limma::eBayes(subcell_var_fit_cont)
+
+# now on "zero var" set
+# prepare matrix for limma and log2 transform
+subcell_peptide_only_mat <- as.matrix(subcell_peptide_only[ , -c(1, 11, 12)])
+subcell_peptide_only_mat <- apply(subcell_peptide_only_mat, 2, log2)
+rownames(subcell_peptide_only_mat) <- subcell_peptide_only$unique_id
+
+cor_novar <- duplicateCorrelation(subcell_peptide_only_mat, 
+                                  subcell_design, 
+                                  block = cell_identity)
+# cor_novar$consensus.correlation
+#-0.09322086
+
+# fit model
+subcell_no_var_fit <- limma::lmFit(subcell_peptide_only_mat, 
+                                   subcell_design,
+                                   block = cell_identity,
+                                   correlation = cor_novar$consensus.correlation)
+
+# fit contrasts
+subcell_no_var_fit_cont <- contrasts.fit(subcell_no_var_fit, subcell.cont)
+
+subcell_no_var_efit <- limma::eBayes(subcell_no_var_fit_cont)
+
+# bind results
+# for Mito vs Cyto
+mito_vs_cyto_results <- dplyr::bind_rows(topTable(subcell_var_efit, 
+         coef = "Mito_v_Cyto",
+         number = nrow(subcell_peptide_norm_var_mat)),
+         topTable(subcell_no_var_efit, 
+         coef = "Mito_v_Cyto",
+         number = nrow(subcell_peptide_only_mat))) %>% 
+            data.frame() %>% 
+            tibble::rownames_to_column("unique_id") %>% 
+         dplyr::mutate(unique_id = str_replace(unique_id, "(?<=\\d)_(?=\\w)", "-")) %>% 
+         dplyr::mutate(unique_id = str_replace(unique_id, "(?<=\\d)-(?=\\d)", "_"))
+
+# for Nuc vs Cyto
+nuc_vs_cyto_results <- dplyr::bind_rows(topTable(subcell_var_efit, 
+         coef = "Nuc_v_Cyto",
+         number = nrow(subcell_peptide_norm_var_mat)),
+         topTable(subcell_no_var_efit, 
+         coef = "Nuc_v_Cyto",
+         number = nrow(subcell_peptide_only_mat))) %>% 
+            data.frame() %>% 
+            tibble::rownames_to_column("unique_id") %>% 
+         dplyr::mutate(unique_id = str_replace(unique_id, "(?<=\\d)_(?=\\w)", "-")) %>% 
+         dplyr::mutate(unique_id = str_replace(unique_id, "(?<=\\d)-(?=\\d)", "_"))
+
+# for Nuc vs Mito
+nuc_vs_mito_results <- dplyr::bind_rows(topTable(subcell_var_efit, 
+         coef = "Nuc_v_Mito",
+         number = nrow(subcell_peptide_norm_var_mat)),
+         topTable(subcell_no_var_efit, 
+         coef = "Nuc_v_Mito",
+         number = nrow(subcell_peptide_only_mat))) %>% 
+            data.frame() %>% 
+            tibble::rownames_to_column("unique_id") %>% 
+         dplyr::mutate(unique_id = str_replace(unique_id, "(?<=\\d)_(?=\\w)", "-")) %>% 
+         dplyr::mutate(unique_id = str_replace(unique_id, "(?<=\\d)-(?=\\d)", "_"))
+
+# Note - the adjusted p-values computed here are incorrect because of the way you initially split the data (and ran limma separately)
+# replace these values with BH-corrected p-values computed using ALL rows
+mito_vs_cyto_results$adj.P.Val <- p.adjust(mito_vs_cyto_results$P.Value,
+                                              method = "BH")
+nuc_vs_cyto_results$adj.P.Val <- p.adjust(nuc_vs_cyto_results$P.Value,
+                                              method = "BH")
+nuc_vs_mito_results$adj.P.Val <- p.adjust(nuc_vs_mito_results$P.Value,
+                                              method = "BH")
+
+# convert to proper name format
+# e.g. MDH1-C123
+protein_site <- read_excel("Proteomics Data/All Acetyl-Cys Peptide groups _ all columns _ 20230330EKK20230327_LiverCellFrac_PD20230403.xlsx")
+  
+protein_site$peptide_id <- paste0("analyte_", 1:nrow(protein_site))
+
+protein_site <- protein_site %>% 
+  tidyr::separate_longer_delim(`Master Protein Accessions`,
+                               delim = ";") %>%
+  tidyr::separate_longer_delim(`Modifications in Master Proteins (all Sites)`,
+                               delim = "];") %>%
+  dplyr::rename(Accession = `Master Protein Accessions`) %>%
+  dplyr::mutate(Accession = str_trim(Accession)) %>%
+  dplyr::mutate(`Modifications in Master Proteins (all Sites)` = str_trim(`Modifications in Master Proteins (all Sites)`,
+                                     side = "left")) %>%
+  dplyr::mutate(`Modifications in Master Proteins (all Sites)` = paste0(`Modifications in Master Proteins (all Sites)`, "]")) %>% 
+  # adding closing square bracked to those residues that are missing it. 
+  dplyr::mutate(`Modifications in Master Proteins (all Sites)` = str_replace(`Modifications in Master Proteins (all Sites)`, "\\]\\]", "\\]")) %>% 
+  # now everything looks good!
+  dplyr::mutate(protein_residue = word(`Modifications in Master Proteins (all Sites)`)) %>% 
+  dplyr::filter(Accession == protein_residue) %>% 
+  dplyr::select(peptide_id, Accession, `Modifications in Master Proteins (all Sites)`) %>% 
+  dplyr::rename(Modification = `Modifications in Master Proteins (all Sites)`) %>% 
+  dplyr::mutate(Modification = str_extract(Modification, "(\\[).+(\\])")) %>%  # pull out anything between square bracket
+  dplyr::mutate(Modification = str_remove_all(Modification, "(?<=\\]).+")) %>% # only keep things inside square brackets
+  tidyr::unite("unique_id", peptide_id:Accession, sep = "-", remove = FALSE) %>% 
+  dplyr::mutate(unique_id = str_replace(unique_id, "(?<=\\d)-(?=\\d)", "_"))
+
+protein_site <- biomaRt::select(org.Mm.eg.db, protein_site$Accession, "SYMBOL", "UNIPROT") %>% 
+  tibble::tibble() %>% 
+  dplyr::inner_join(protein_site, by = c("UNIPROT" = "Accession")) %>% 
+  dplyr::mutate(SYMBOL = str_to_upper(SYMBOL)) %>% 
+  tidyr::unite("protein_mod", c(SYMBOL, Modification), sep = "-") %>% 
+  dplyr::mutate(protein_mod = if_else(str_detect(protein_mod, "^NA"),
+                                      NA,
+                                      protein_mod)) %>% 
+  dplyr::select(unique_id, protein_mod)
+
+# join
+# for Mito vs Cyto
+mito_vs_cyto_results_join <- mito_vs_cyto_results %>% 
+  dplyr::inner_join(protein_site, by = "unique_id") %>% 
+  dplyr::distinct()
+# for Nuc vs Cyto
+nuc_vs_cyto_results_join <- nuc_vs_cyto_results %>% 
+  dplyr::inner_join(protein_site, by = "unique_id") %>% 
+  dplyr::distinct()
+# for Nuc vs Mito
+nuc_vs_mito_results_join <- nuc_vs_mito_results %>% 
+  dplyr::inner_join(protein_site, by = "unique_id") %>% 
+  dplyr::distinct()
+# save results
+# write_csv(mito_vs_cyto_results_join, "results/mito_vs_cyto_limma.csv")
+# write_csv(nuc_vs_cyto_results_join, "results/nuc_vs_cyto_limma.csv")
+# write_csv(nuc_vs_mito_results_join, "results/nuc_vs_mito_limma.csv")
+# all last saved on 04/30/2024
+
+# plots
+mito_vs_cyto_results_join %>% 
+  dplyr::mutate(protein_mod = str_remove(protein_mod, "-\\[.+")) %>% 
+  dplyr::mutate(protein_mod = str_remove(protein_mod, "-NA")) %>% 
+  ggplot(aes(logFC, -log10(adj.P.Val))) +
+  geom_point(col = "grey") +
+  geom_vline(xintercept = -2, linetype = 2) +
+  geom_vline(xintercept = 2, linetype = 2) +
+  geom_hline(yintercept = -log10(0.1), linetype = 3) +
+  geom_vline(xintercept = 0, linetype = 1) +
+  geom_hline(yintercept = 0, linetype = 1) +
+  geom_point(data = . %>% filter(logFC > 2 & adj.P.Val < 0.1), col = "red") +
+  geom_point(data = . %>% filter(logFC < -2 & adj.P.Val < 0.1), col = "blue") +
+  geom_text_repel(data = . %>% filter(logFC > 2 & adj.P.Val < 0.1), aes(label = protein_mod),
+            vjust = -1, hjust = 1) +
+  geom_text_repel(data = . %>% filter(logFC < -2 & adj.P.Val < 0.1), aes(label = protein_mod),
+            vjust = -1, hjust = -0.1) +
+  labs(title = "Mito vs Cyto") +
+  theme_bw() +
+  scale_x_continuous(limits = c(-10, 10)) +
+  scale_y_continuous(limits = c(0, 4)) 
+
+nuc_vs_cyto_results_join %>% 
+  dplyr::mutate(protein_mod = str_remove(protein_mod, "-\\[.+")) %>% 
+  dplyr::mutate(protein_mod = str_remove(protein_mod, "-NA")) %>% 
+  ggplot(aes(logFC, -log10(adj.P.Val))) +
+  geom_point(col = "grey") +
+  geom_vline(xintercept = -2, linetype = 2) +
+  geom_vline(xintercept = 2, linetype = 2) +
+  geom_hline(yintercept = -log10(0.1), linetype = 3) +
+  geom_vline(xintercept = 0, linetype = 1) +
+  geom_hline(yintercept = 0, linetype = 1) +
+  geom_point(data = . %>% filter(logFC > 2 & adj.P.Val < 0.1), col = "red") +
+  geom_point(data = . %>% filter(logFC < -2 & adj.P.Val < 0.1), col = "blue") +
+  geom_text_repel(data = . %>% filter(logFC > 2 & adj.P.Val < 0.1), aes(label = protein_mod),
+            vjust = -1, hjust = 1) +
+  geom_text_repel(data = . %>% filter(logFC < -2 & adj.P.Val < 0.1), aes(label = protein_mod),
+            vjust = -1, hjust = -0.1) +
+  labs(title = "Nuc vs Cyto") +
+  theme_bw() +
+  scale_x_continuous(limits = c(-10, 10)) +
+  scale_y_continuous(limits = c(0, 4)) 
+
+nuc_vs_mito_results_join %>% 
+  dplyr::mutate(protein_mod = str_remove(protein_mod, "-\\[.+")) %>% 
+  dplyr::mutate(protein_mod = str_remove(protein_mod, "-NA")) %>% 
+  ggplot(aes(logFC, -log10(adj.P.Val))) +
+  geom_point(col = "grey") +
+  geom_vline(xintercept = -2, linetype = 2) +
+  geom_vline(xintercept = 2, linetype = 2) +
+  geom_hline(yintercept = -log10(0.1), linetype = 3) +
+  geom_vline(xintercept = 0, linetype = 1) +
+  geom_hline(yintercept = 0, linetype = 1) +
+  geom_point(data = . %>% filter(logFC > 2 & adj.P.Val < 0.1), col = "red") +
+  geom_point(data = . %>% filter(logFC < -2 & adj.P.Val < 0.1), col = "blue") +
+  geom_text_repel(data = . %>% filter(logFC > 2 & adj.P.Val < 0.1), aes(label = protein_mod),
+            vjust = -1, hjust = 1) +
+  geom_text_repel(data = . %>% filter(logFC < -2 & adj.P.Val < 0.1), aes(label = protein_mod),
+            vjust = -1, hjust = -0.1) +
+  labs(title = "Nuc vs Mito") +
+  theme_bw() +
+  scale_x_continuous(limits = c(-10, 10)) +
+  scale_y_continuous(limits = c(0, 4)) 
+```
+
+### Venn diagram
+
+```{r message = FALSE, warning = FALSE}
+# import peptide-level data
+subcell_peptide <- read_excel("Proteomics Data/All Acetyl-Cys Peptide groups _ all columns _ 20230330EKK20230327_LiverCellFrac_PD20230403.xlsx")
+
+# Add a unique identifier to each row
+subcell_peptide$peptide_id <- paste0("analyte_", 1:nrow(subcell_peptide))
+
+subcel_venn <- subcell_peptide %>% 
+  dplyr::select(peptide_id, contains("Found in Sample Group")) %>% 
+  dplyr::select(!contains("Total"))
+
+mito_group <- subcel_venn[subcel_venn[[3]] != "Not Found", ]$peptide_id
+cyto_group <- subcel_venn[subcel_venn[[2]] != "Not Found", ]$peptide_id
+nuc_group <- subcel_venn[subcel_venn[[4]] != "Not Found", ]$peptide_id
+  
+# Venn diagram
+venn.diagram(
+  x = list(mito_group, cyto_group, nuc_group),
+  category.names = c("Mito" , "Cyto" , "Nuc"),
+  filename = 'results/subcell_frac_venn_diagram.png',
+  output = TRUE
+)
+```
+
+## Figure 3
+
+Multi-tissue survey of the murine cysteine acetylome. 
+
+```{r message = FALSE, warning = FALSE}
+# import peptide-level data and replace NAs with mean of remaining samples in name group
+# remove any rows that still have NAs
+# acetyl only
+bat_acetyl <- read_excel("MultiTissueSurvey/BAT _ All Acetyl-Cys Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_BAT.xlsx") %>% 
+              dplyr::select(`Master Protein Accessions`, `Modifications in Master Proteins (all Sites)`, starts_with("Abundance:")) %>% 
+              dplyr::rowwise() %>% 
+              dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+              dplyr::ungroup() %>% 
+              dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+              dplyr::select(-row_means) %>% 
+              tidyr::drop_na() %>% # drop any rows that only have NAs across all samples
+              dplyr::group_by(`Modifications in Master Proteins (all Sites)`) %>% 
+              dplyr::summarise(across(starts_with("Abundance"), sum)) %>% 
+              dplyr::ungroup() # because some of these data frames have duplicates in these columns
+
+# check uniqueness of peptides
+# length(unique(bat_acetyl$`Modifications in Master Proteins (all Sites)`))/nrow(bat_acetyl)
+# 1
+
+brain_acetyl <- read_excel("MultiTissueSurvey/Brain _ All Acetyl-Cys Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Brain.xlsx") %>% 
+              dplyr::select(`Master Protein Accessions`, `Modifications in Master Proteins (all Sites)`, starts_with("Abundance:")) %>% 
+              dplyr::rowwise() %>% 
+              dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+              dplyr::ungroup() %>% 
+              dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+              dplyr::select(-row_means) %>% 
+              tidyr::drop_na() %>% # drop any rows that only have NAs across all samples
+              dplyr::group_by(`Modifications in Master Proteins (all Sites)`) %>% 
+              dplyr::summarise(across(starts_with("Abundance"), sum)) %>% 
+              dplyr::ungroup() # because some of these data frames have duplicates in these columns
+
+# check uniqueness of peptides
+# length(unique(brain_acetyl$`Modifications in Master Proteins (all Sites)`))/nrow(brain_acetyl)
+# 1
+
+heart_acetyl <- read_excel("MultiTissueSurvey/Heart _ All Acetyl-Cys Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Heart.xlsx") %>% 
+              dplyr::select(`Master Protein Accessions`, `Modifications in Master Proteins (all Sites)`, starts_with("Abundance:")) %>% 
+              dplyr::rowwise() %>% 
+              dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+              dplyr::ungroup() %>% 
+              dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+              dplyr::select(-row_means) %>% 
+              tidyr::drop_na() %>% # drop any rows that only have NAs across all samples
+              dplyr::group_by(`Modifications in Master Proteins (all Sites)`) %>% 
+              dplyr::summarise(across(starts_with("Abundance"), sum)) %>% 
+              dplyr::ungroup() # because some of these data frames have duplicates in these columns
+
+# check uniqueness of peptides
+# length(unique(heart_acetyl$`Modifications in Master Proteins (all Sites)`))/nrow(heart_acetyl)
+# 1
+
+kidney_acetyl <- read_excel("MultiTissueSurvey/Kidney _ All Acetyl-Cys Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Kidney.xlsx") %>% 
+              dplyr::select(`Master Protein Accessions`, `Modifications in Master Proteins (all Sites)`, starts_with("Abundance:")) %>% 
+              dplyr::rowwise() %>% 
+              dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+              dplyr::ungroup() %>% 
+              dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+              dplyr::select(-row_means) %>% 
+              tidyr::drop_na() %>% # drop any rows that only have NAs across all samples
+              dplyr::group_by(`Modifications in Master Proteins (all Sites)`) %>% 
+              dplyr::summarise(across(starts_with("Abundance"), sum)) %>% 
+              dplyr::ungroup() # because some of these data frames have duplicates in these columns
+
+# check uniqueness of peptides
+# length(unique(kidney_acetyl$`Modifications in Master Proteins (all Sites)`))/nrow(kidney_acetyl)
+# 1
+
+liver_acetyl <- read_excel("MultiTissueSurvey/Liver _ All Acetyl-Cys Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Liver.xlsx") %>% 
+              dplyr::select(`Master Protein Accessions`, `Modifications in Master Proteins (all Sites)`, starts_with("Abundance:")) %>% 
+              dplyr::rowwise() %>% 
+              dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+              dplyr::ungroup() %>% 
+              dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+              dplyr::select(-row_means) %>% 
+              tidyr::drop_na() %>% # drop any rows that only have NAs across all samples
+              dplyr::group_by(`Modifications in Master Proteins (all Sites)`) %>% 
+              dplyr::summarise(across(starts_with("Abundance"), sum)) %>% 
+              dplyr::ungroup() # because some of these data frames have duplicates in these columns
+
+# check uniqueness of peptides
+# length(unique(liver_acetyl$`Modifications in Master Proteins (all Sites)`))/nrow(liver_acetyl)
+# 1
+
+lung_acetyl <- read_excel("MultiTissueSurvey/Lung _ All Acetyl_Cys Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Lung.xlsx") %>% 
+              dplyr::select(`Master Protein Accessions`, `Modifications in Master Proteins (all Sites)`, starts_with("Abundance:")) %>% 
+              dplyr::rowwise() %>% 
+              dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+              dplyr::ungroup() %>% 
+              dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+              dplyr::select(-row_means) %>% 
+              tidyr::drop_na() %>% # drop any rows that only have NAs across all samples
+              dplyr::group_by(`Modifications in Master Proteins (all Sites)`) %>% 
+              dplyr::summarise(across(starts_with("Abundance"), sum)) %>% 
+              dplyr::ungroup() # because some of these data frames have duplicates in these columns
+
+# check uniqueness of peptides
+# length(unique(lung_acetyl$`Modifications in Master Proteins (all Sites)`))/nrow(lung_acetyl)
+# 1
+
+pancreas_acetyl <- read_excel("MultiTissueSurvey/Pancreas _ All Acetyl-Cys Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen__gBeW.xlsx") %>% 
+              dplyr::select(`Master Protein Accessions`, `Modifications in Master Proteins (all Sites)`, starts_with("Abundance:")) %>% 
+              dplyr::rowwise() %>% 
+              dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+              dplyr::ungroup() %>% 
+              dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+              dplyr::select(-row_means) %>% 
+              tidyr::drop_na() %>% # drop any rows that only have NAs across all samples
+              dplyr::group_by(`Modifications in Master Proteins (all Sites)`) %>% 
+              dplyr::summarise(across(starts_with("Abundance"), sum)) %>% 
+              dplyr::ungroup() # because some of these data frames have duplicates in these columns
+
+# check uniqueness of peptides
+# length(unique(pancreas_acetyl$`Modifications in Master Proteins (all Sites)`))/nrow(pancreas_acetyl)
+# 1
+
+skm_acetyl <- read_excel("MultiTissueSurvey/Skm _ All Acetyl-Cys Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Skm.xlsx") %>% 
+              dplyr::select(`Master Protein Accessions`, `Modifications in Master Proteins (all Sites)`, starts_with("Abundance:")) %>% 
+              dplyr::rowwise() %>% 
+              dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+              dplyr::ungroup() %>% 
+              dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+              dplyr::select(-row_means) %>% 
+              tidyr::drop_na() %>% # drop any rows that only have NAs across all samples
+              dplyr::group_by(`Modifications in Master Proteins (all Sites)`) %>% 
+              dplyr::summarise(across(starts_with("Abundance"), sum)) %>% 
+              dplyr::ungroup() # because some of these data frames have duplicates in these columns
+
+# check uniqueness of peptides
+# length(unique(skm_acetyl$`Modifications in Master Proteins (all Sites)`))/nrow(skm_acetyl)
+# 1
+
+spleen_acetyl <- read_excel("MultiTissueSurvey/Spleen _ All Acetyl-Cys Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Spleen.xlsx") %>% 
+              dplyr::select(`Master Protein Accessions`, `Modifications in Master Proteins (all Sites)`, starts_with("Abundance:")) %>% 
+              dplyr::rowwise() %>% 
+              dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+              dplyr::ungroup() %>% 
+              dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+              dplyr::select(-row_means) %>% 
+              tidyr::drop_na() %>% # drop any rows that only have NAs across all samples
+              dplyr::group_by(`Modifications in Master Proteins (all Sites)`) %>% 
+              dplyr::summarise(across(starts_with("Abundance"), sum)) %>% 
+              dplyr::ungroup() # because some of these data frames have duplicates in these columns
+
+# check uniqueness of peptides
+# length(unique(spleen_acetyl$`Modifications in Master Proteins (all Sites)`))/nrow(spleen_acetyl)
+# 1
+
+total_acetyl <- read_excel("MultiTissueSurvey/Total _ All Acetyl-Cys Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Total.xlsx") %>% 
+              dplyr::select(`Master Protein Accessions`, `Modifications in Master Proteins (all Sites)`, starts_with("Abundance:")) %>% 
+              dplyr::rowwise() %>% 
+              dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+              dplyr::ungroup() %>% 
+              dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+              dplyr::select(-row_means) %>% 
+              tidyr::drop_na() %>% # drop any rows that only have NAs across all samples
+              dplyr::group_by(`Modifications in Master Proteins (all Sites)`) %>% 
+              dplyr::summarise(across(starts_with("Abundance"), sum)) %>% 
+              dplyr::ungroup() # because some of these data frames have duplicates in these columns
+
+# check uniqueness of peptides
+# length(unique(total_acetyl$`Modifications in Master Proteins (all Sites)`))/nrow(total_acetyl)
+# 1
+
+# normalize to total peptide sums
+bat_peptide_colsums <- read_excel("MultiTissueSurvey/BAT _ All Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_BAT.xlsx") %>% 
+                       dplyr::select(starts_with("Abundance:")) %>% 
+  colSums(., na.rm = TRUE)
+bat_peptide_colsums_df <- data.frame(as.list(bat_peptide_colsums))
+
+brain_peptide_colsums <- read_excel("MultiTissueSurvey/Brain _ All Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Brain.xlsx") %>% 
+                       dplyr::select(starts_with("Abundance:")) %>% 
+  colSums(., na.rm = TRUE)
+brain_peptide_colsums_df <- data.frame(as.list(brain_peptide_colsums))
+
+heart_peptide_colsums <- read_excel("MultiTissueSurvey/Heart _ All Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Heart.xlsx") %>% 
+                       dplyr::select(starts_with("Abundance:")) %>% 
+  colSums(., na.rm = TRUE)
+heart_peptide_colsums_df <- data.frame(as.list(heart_peptide_colsums))
+
+kidney_peptide_colsums <- read_excel("MultiTissueSurvey/Kidney _ All Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Kidney.xlsx") %>% 
+                       dplyr::select(starts_with("Abundance:")) %>% 
+  colSums(., na.rm = TRUE) # NOTE - no Abundance columns!
+kidney_peptide_colsums_df <- data.frame(as.list(kidney_peptide_colsums))
+
+liver_peptide_colsums <- read_excel("MultiTissueSurvey/Liver _ All Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Liver.xlsx") %>% 
+                       dplyr::select(starts_with("Abundance:")) %>% 
+  colSums(., na.rm = TRUE)
+liver_peptide_colsums_df <- data.frame(as.list(liver_peptide_colsums))
+
+lung_peptide_colsums <- read_excel("MultiTissueSurvey/Lung _ All Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Lung.xlsx") %>% 
+                       dplyr::select(starts_with("Abundance:")) %>% 
+  colSums(., na.rm = TRUE)
+lung_peptide_colsums_df <- data.frame(as.list(lung_peptide_colsums))
+
+pancreas_peptide_colsums <- read_excel("MultiTissueSurvey/Pancreas _ All Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Pancreas.xlsx") %>% 
+                       dplyr::select(starts_with("Abundance:")) %>% 
+  colSums(., na.rm = TRUE)
+pancreas_peptide_colsums_df <- data.frame(as.list(pancreas_peptide_colsums))
+
+skm_peptide_colsums <- read_excel("MultiTissueSurvey/Skm _ All Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Skm.xlsx") %>% 
+                       dplyr::select(starts_with("Abundance:")) %>% 
+  colSums(., na.rm = TRUE)
+skm_peptide_colsums_df <- data.frame(as.list(skm_peptide_colsums))
+
+spleen_peptide_colsums <- read_excel("MultiTissueSurvey/Spleen _ All Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Spleen.xlsx") %>% 
+                       dplyr::select(starts_with("Abundance:")) %>% 
+  colSums(., na.rm = TRUE)
+spleen_peptide_colsums_df <- data.frame(as.list(spleen_peptide_colsums))
+
+total_peptide_colsums <- read_excel("MultiTissueSurvey/Total _ All Peptide groups _ all columns _ 2024-01-04_AcetylCysTissueScreen_Total.xlsx") %>% 
+                       dplyr::select(starts_with("Abundance:")) %>% 
+  colSums(., na.rm = TRUE)
+total_peptide_colsums_df <- data.frame(as.list(total_peptide_colsums))
+
+# Divide "Abundance:" columns by these colsums
+bat_acetyl <- bat_acetyl %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(c_across(starts_with("Abundance:")) / bat_peptide_colsums_df, .keep = "unused") %>%
+  dplyr::rename_with(.cols = contains(".."), ~str_replace_all(., "\\.+", ": ")) %>% # we do this because the line above changes the sample names
+  dplyr::rename_with(.cols = starts_with("Abundance"), ~str_replace(., "Sample:", "Sample,")) %>% 
+  dplyr::ungroup()
+
+brain_acetyl <- brain_acetyl %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(c_across(starts_with("Abundance:")) / brain_peptide_colsums_df, .keep = "unused") %>%
+  dplyr::rename_with(.cols = contains(".."), ~str_replace_all(., "\\.+", ": ")) %>% # we do this because the line above changes the sample names
+  dplyr::rename_with(.cols = starts_with("Abundance"), ~str_replace(., "Sample:", "Sample,")) %>% 
+  dplyr::ungroup()
+
+heart_acetyl <- heart_acetyl %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(c_across(starts_with("Abundance:")) / heart_peptide_colsums_df, .keep = "unused") %>%
+  dplyr::rename_with(.cols = contains(".."), ~str_replace_all(., "\\.+", ": ")) %>% # we do this because the line above changes the sample names
+  dplyr::rename_with(.cols = starts_with("Abundance"), ~str_replace(., "Sample:", "Sample,")) %>% 
+  dplyr::ungroup()
+
+kidney_acetyl <- kidney_acetyl %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(c_across(starts_with("Abundance:")) / kidney_peptide_colsums_df, .keep = "unused") %>%
+  dplyr::rename_with(.cols = contains(".."), ~str_replace_all(., "\\.+", ": ")) %>% # we do this because the line above changes the sample names
+  dplyr::rename_with(.cols = starts_with("Abundance"), ~str_replace(., "Sample:", "Sample,")) %>%
+  dplyr::ungroup()
+
+liver_acetyl <- liver_acetyl %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(c_across(starts_with("Abundance:")) / liver_peptide_colsums_df, .keep = "unused") %>%
+  dplyr::rename_with(.cols = contains(".."), ~str_replace_all(., "\\.+", ": ")) %>% # we do this because the line above changes the sample names
+  dplyr::rename_with(.cols = starts_with("Abundance"), ~str_replace(., "Sample:", "Sample,")) %>% 
+  dplyr::ungroup()
+
+lung_acetyl <- lung_acetyl %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(c_across(starts_with("Abundance:")) / lung_peptide_colsums_df, .keep = "unused") %>%
+  dplyr::rename_with(.cols = contains(".."), ~str_replace_all(., "\\.+", ": ")) %>% # we do this because the line above changes the sample names
+  dplyr::rename_with(.cols = starts_with("Abundance"), ~str_replace(., "Sample:", "Sample,")) %>% 
+  dplyr::ungroup()
+
+pancreas_acetyl <- pancreas_acetyl %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(c_across(starts_with("Abundance:")) / pancreas_peptide_colsums_df, .keep = "unused") %>%
+  dplyr::rename_with(.cols = contains(".."), ~str_replace_all(., "\\.+", ": ")) %>% # we do this because the line above changes the sample names
+  dplyr::rename_with(.cols = starts_with("Abundance"), ~str_replace(., "Sample:", "Sample,")) %>% 
+  dplyr::ungroup()
+
+skm_acetyl <- skm_acetyl %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(c_across(starts_with("Abundance:")) / skm_peptide_colsums_df, .keep = "unused") %>%
+  dplyr::rename_with(.cols = contains(".."), ~str_replace_all(., "\\.+", ": ")) %>% # we do this because the line above changes the sample names
+  dplyr::rename_with(.cols = starts_with("Abundance"), ~str_replace(., "Sample:", "Sample,")) %>% 
+  dplyr::ungroup()
+
+spleen_acetyl <- spleen_acetyl %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(c_across(starts_with("Abundance:")) / spleen_peptide_colsums_df, .keep = "unused") %>%
+  dplyr::rename_with(.cols = contains(".."), ~str_replace_all(., "\\.+", ": ")) %>% # we do this because the line above changes the sample names
+  dplyr::rename_with(.cols = starts_with("Abundance"), ~str_replace(., "Sample:", "Sample,")) %>% 
+  dplyr::ungroup()
+
+total_acetyl <- total_acetyl %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(c_across(starts_with("Abundance:")) / total_peptide_colsums_df, .keep = "unused") %>%
+  dplyr::rename_with(.cols = contains(".."), ~str_replace_all(., "\\.+", ": ")) %>% # we do this because the line above changes the sample names
+  dplyr::rename_with(.cols = starts_with("Abundance"), ~str_replace(., "Sample:", "Sample,")) %>% 
+  dplyr::ungroup()
+
+# # perform mean imputation for protein abundances
+# bat_protein <- read_excel("MultiTissueSurvey/BAT _ All Proteins _ all columns _ 2024-01-04_AcetylCysTissueScreen_BAT.xlsx") %>% 
+#                    dplyr::select(Accession, starts_with("Abundance:")) %>% 
+#                    dplyr::rowwise() %>% 
+#                    dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+#                    dplyr::ungroup() %>% 
+#                    dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+#                    dplyr::select(-row_means) %>% 
+#                    tidyr::drop_na()
+# 
+# brain_protein <- read_excel("MultiTissueSurvey/Brain _ All Proteins _ all columns _ 2024-01-04_AcetylCysTissueScreen_Brain.xlsx") %>% 
+#                    dplyr::select(Accession, starts_with("Abundance:")) %>% 
+#                    dplyr::rowwise() %>% 
+#                    dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+#                    dplyr::ungroup() %>% 
+#                    dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+#                    dplyr::select(-row_means) %>% 
+#                    tidyr::drop_na()
+# 
+# heart_protein <- read_excel("MultiTissueSurvey/Heart _ All Proteins _ all columns _ 2024-01-04_AcetylCysTissueScreen_Heart.xlsx") %>% 
+#                    dplyr::select(Accession, starts_with("Abundance:")) %>% 
+#                    dplyr::rowwise() %>% 
+#                    dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+#                    dplyr::ungroup() %>% 
+#                    dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+#                    dplyr::select(-row_means) %>% 
+#                    tidyr::drop_na()
+# 
+# # kidney_protein <- read_excel("MultiTissueSurvey/Kidney _ All Proteins _ all columns _ 2024-01-04_AcetylCysTissueScreen_Kidney.xlsx") %>% 
+# #                    dplyr::select(Accession, starts_with("Abundance:")) %>% 
+# #                    dplyr::rowwise() %>% 
+# #                    dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+# #                    dplyr::ungroup() %>% 
+# #                    dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+# #                    dplyr::select(-row_means) %>% 
+# #                    tidyr::drop_na()
+# 
+# liver_protein <- read_excel("MultiTissueSurvey/Liver _ All Proteins _ all columns _ 2024-01-04_AcetylCysTissueScreen_Liver.xlsx") %>% 
+#                    dplyr::select(Accession, starts_with("Abundance:")) %>% 
+#                    dplyr::rowwise() %>% 
+#                    dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+#                    dplyr::ungroup() %>% 
+#                    dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+#                    dplyr::select(-row_means) %>% 
+#                    tidyr::drop_na()
+# 
+# lung_protein <- read_excel("MultiTissueSurvey/Lung _ All Proteins _ all columns _ 2024-01-04_AcetylCysTissueScreen_Lung.xlsx") %>% 
+#                    dplyr::select(Accession, starts_with("Abundance:")) %>% 
+#                    dplyr::rowwise() %>% 
+#                    dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+#                    dplyr::ungroup() %>% 
+#                    dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+#                    dplyr::select(-row_means) %>% 
+#                    tidyr::drop_na()
+# 
+# pancreas_protein <- read_excel("MultiTissueSurvey/Pancreas _ All Proteins _ all columns _ 2024-01-04_AcetylCysTissueScreen_Pancreas.xlsx") %>% 
+#                    dplyr::select(Accession, starts_with("Abundance:")) %>% 
+#                    dplyr::rowwise() %>% 
+#                    dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+#                    dplyr::ungroup() %>% 
+#                    dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+#                    dplyr::select(-row_means) %>% 
+#                    tidyr::drop_na()
+# 
+# skm_protein <- read_excel("MultiTissueSurvey/Skm _ All Proteins _ all columns _ 2024-01-04_AcetylCysTissueScreen_Skm.xlsx") %>% 
+#                    dplyr::select(Accession, starts_with("Abundance:")) %>% 
+#                    dplyr::rowwise() %>% 
+#                    dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+#                    dplyr::ungroup() %>% 
+#                    dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+#                    dplyr::select(-row_means) %>% 
+#                    tidyr::drop_na()
+# 
+# spleen_protein <- read_excel("MultiTissueSurvey/Spleen _ All Proteins _ all columns _ 2024-01-04_AcetylCysTissueScreen_Spleen.xlsx") %>% 
+#                    dplyr::select(Accession, starts_with("Abundance:")) %>% 
+#                    dplyr::rowwise() %>% 
+#                    dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+#                    dplyr::ungroup() %>% 
+#                    dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+#                    dplyr::select(-row_means) %>% 
+#                    tidyr::drop_na()
+# 
+# total_protein <- read_excel("MultiTissueSurvey/Total _ All Proteins _ all columns _ 2024-01-04_AcetylCysTissueScreen_Total.xlsx") %>% 
+#                    dplyr::select(Accession, starts_with("Abundance:")) %>% 
+#                    dplyr::rowwise() %>% 
+#                    dplyr::mutate(row_means = mean(c_across(starts_with("Abundance:")), na.rm = TRUE)) %>% 
+#                    dplyr::ungroup() %>% 
+#                    dplyr::mutate(across(starts_with("Abundance:"), ~ coalesce(., row_means))) %>% 
+#                    dplyr::select(-row_means) %>% 
+#                    tidyr::drop_na()
+# 
+# # normalize peptide values to protein values
+# # reshape peptide data frame
+# bat_acetyl_long <- bat_acetyl %>%
+#   tidyr::separate_longer_delim(`Master Protein Accessions`,
+#                                delim = ";") %>%
+#   tidyr::pivot_longer(
+#     cols = starts_with("Abundance"),
+#     names_to = "sample_name",
+#     values_to = "peptide_value"
+#   ) %>%
+#   dplyr::rename(Accession = `Master Protein Accessions`) %>%
+#   dplyr::mutate(Accession = str_trim(Accession))
+# 
+# brain_acetyl_long <- brain_acetyl %>%
+#   tidyr::separate_longer_delim(`Master Protein Accessions`,
+#                                delim = ";") %>%
+#   tidyr::pivot_longer(
+#     cols = starts_with("Abundance"),
+#     names_to = "sample_name",
+#     values_to = "peptide_value"
+#   ) %>%
+#   dplyr::rename(Accession = `Master Protein Accessions`) %>%
+#   dplyr::mutate(Accession = str_trim(Accession))
+# 
+# heart_acetyl_long <- heart_acetyl %>%
+#   tidyr::separate_longer_delim(`Master Protein Accessions`,
+#                                delim = ";") %>%
+#   tidyr::pivot_longer(
+#     cols = starts_with("Abundance"),
+#     names_to = "sample_name",
+#     values_to = "peptide_value"
+#   ) %>%
+#   dplyr::rename(Accession = `Master Protein Accessions`) %>%
+#   dplyr::mutate(Accession = str_trim(Accession))
+# 
+# # kidney_acetyl_long <- kidney_acetyl %>%
+# #   tidyr::separate_longer_delim(`Master Protein Accessions`,
+# #                                delim = ";") %>%
+# #   tidyr::pivot_longer(
+# #     cols = starts_with("Abundance"),
+# #     names_to = "sample_name",
+# #     values_to = "peptide_value"
+# #   ) %>%
+# #   dplyr::rename(Accession = `Master Protein Accessions`) %>%
+# #   dplyr::mutate(Accession = str_trim(Accession))
+# 
+# liver_acetyl_long <- liver_acetyl %>%
+#   tidyr::separate_longer_delim(`Master Protein Accessions`,
+#                                delim = ";") %>%
+#   tidyr::pivot_longer(
+#     cols = starts_with("Abundance"),
+#     names_to = "sample_name",
+#     values_to = "peptide_value"
+#   ) %>%
+#   dplyr::rename(Accession = `Master Protein Accessions`) %>%
+#   dplyr::mutate(Accession = str_trim(Accession))
+# 
+# lung_acetyl_long <- lung_acetyl %>%
+#   tidyr::separate_longer_delim(`Master Protein Accessions`,
+#                                delim = ";") %>%
+#   tidyr::pivot_longer(
+#     cols = starts_with("Abundance"),
+#     names_to = "sample_name",
+#     values_to = "peptide_value"
+#   ) %>%
+#   dplyr::rename(Accession = `Master Protein Accessions`) %>%
+#   dplyr::mutate(Accession = str_trim(Accession))
+# 
+# pancreas_acetyl_long <- pancreas_acetyl %>%
+#   tidyr::separate_longer_delim(`Master Protein Accessions`,
+#                                delim = ";") %>%
+#   tidyr::pivot_longer(
+#     cols = starts_with("Abundance"),
+#     names_to = "sample_name",
+#     values_to = "peptide_value"
+#   ) %>%
+#   dplyr::rename(Accession = `Master Protein Accessions`) %>%
+#   dplyr::mutate(Accession = str_trim(Accession))
+# 
+# skm_acetyl_long <- skm_acetyl %>%
+#   tidyr::separate_longer_delim(`Master Protein Accessions`,
+#                                delim = ";") %>%
+#   tidyr::pivot_longer(
+#     cols = starts_with("Abundance"),
+#     names_to = "sample_name",
+#     values_to = "peptide_value"
+#   ) %>%
+#   dplyr::rename(Accession = `Master Protein Accessions`) %>%
+#   dplyr::mutate(Accession = str_trim(Accession))
+# 
+# spleen_acetyl_long <- spleen_acetyl %>%
+#   tidyr::separate_longer_delim(`Master Protein Accessions`,
+#                                delim = ";") %>%
+#   tidyr::pivot_longer(
+#     cols = starts_with("Abundance"),
+#     names_to = "sample_name",
+#     values_to = "peptide_value"
+#   ) %>%
+#   dplyr::rename(Accession = `Master Protein Accessions`) %>%
+#   dplyr::mutate(Accession = str_trim(Accession))
+# 
+# total_acetyl_long <- total_acetyl %>%
+#   tidyr::separate_longer_delim(`Master Protein Accessions`,
+#                                delim = ";") %>%
+#   tidyr::pivot_longer(
+#     cols = starts_with("Abundance"),
+#     names_to = "sample_name",
+#     values_to = "peptide_value"
+#   ) %>%
+#   dplyr::rename(Accession = `Master Protein Accessions`) %>%
+#   dplyr::mutate(Accession = str_trim(Accession))
+# 
+# # reshape protein data frame
+# bat_protein_long <- bat_protein %>% 
+#   tidyr::pivot_longer(cols = starts_with("Abundance"),
+#                       names_to = "sample_name",
+#                       values_to = "protein_value")
+# 
+# brain_protein_long <- brain_protein %>% 
+#   tidyr::pivot_longer(cols = starts_with("Abundance"),
+#                       names_to = "sample_name",
+#                       values_to = "protein_value")
+# 
+# heart_protein_long <- heart_protein %>% 
+#   tidyr::pivot_longer(cols = starts_with("Abundance"),
+#                       names_to = "sample_name",
+#                       values_to = "protein_value")
+# 
+# # kidney_protein_long <- kidney_protein %>% 
+# #   tidyr::pivot_longer(cols = starts_with("Abundance"),
+# #                       names_to = "sample_name",
+# #                       values_to = "protein_value")
+# 
+# liver_protein_long <- liver_protein %>% 
+#   tidyr::pivot_longer(cols = starts_with("Abundance"),
+#                       names_to = "sample_name",
+#                       values_to = "protein_value")
+# 
+# lung_protein_long <- lung_protein %>% 
+#   tidyr::pivot_longer(cols = starts_with("Abundance"),
+#                       names_to = "sample_name",
+#                       values_to = "protein_value")
+# 
+# pancreas_protein_long <- pancreas_protein %>% 
+#   tidyr::pivot_longer(cols = starts_with("Abundance"),
+#                       names_to = "sample_name",
+#                       values_to = "protein_value")
+# 
+# skm_protein_long <- skm_protein %>% 
+#   tidyr::pivot_longer(cols = starts_with("Abundance"),
+#                       names_to = "sample_name",
+#                       values_to = "protein_value")
+# 
+# spleen_protein_long <- spleen_protein %>% 
+#   tidyr::pivot_longer(cols = starts_with("Abundance"),
+#                       names_to = "sample_name",
+#                       values_to = "protein_value")
+# 
+# total_protein_long <- total_protein %>% 
+#   tidyr::pivot_longer(cols = starts_with("Abundance"),
+#                       names_to = "sample_name",
+#                       values_to = "protein_value")
+# 
+# # join data frames, normalize peptide value, and reshape
+# bat_acetyl_norm <- bat_acetyl_long %>% 
+#   dplyr::inner_join(bat_protein_long,
+#                     by = c("Accession", "sample_name")) %>% 
+#   dplyr::mutate(normalized_value = peptide_value/protein_value,
+#                    .keep = "unused") %>%
+#   tidyr::pivot_wider(
+#     names_from = sample_name,
+#     values_from = normalized_value
+#   )
+# 
+# brain_acetyl_norm <- brain_acetyl_long %>% 
+#   dplyr::inner_join(bat_protein_long,
+#                     by = c("Accession", "sample_name")) %>% 
+#   dplyr::mutate(normalized_value = peptide_value/protein_value,
+#                    .keep = "unused") %>%
+#   tidyr::pivot_wider(
+#     names_from = sample_name,
+#     values_from = normalized_value
+#   )
+# 
+# heart_acetyl_norm <- heart_acetyl_long %>% 
+#   dplyr::inner_join(bat_protein_long,
+#                     by = c("Accession", "sample_name")) %>% 
+#   dplyr::mutate(normalized_value = peptide_value/protein_value,
+#                    .keep = "unused") %>%
+#   tidyr::pivot_wider(
+#     names_from = sample_name,
+#     values_from = normalized_value
+#   )
+# 
+# # kidney_peptide_norm <- kidney_peptide_long %>% 
+# #   dplyr::inner_join(bat_protein_long,
+# #                     by = c("Accession", "sample_name")) %>% 
+# #   dplyr::mutate(normalized_value = peptide_value/protein_value,
+# #                    .keep = "unused") %>%
+# #   tidyr::pivot_wider(
+# #     names_from = sample_name,
+# #     values_from = normalized_value
+# #   )
+# 
+# liver_acetyl_norm <- liver_acetyl_long %>% 
+#   dplyr::inner_join(bat_protein_long,
+#                     by = c("Accession", "sample_name")) %>% 
+#   dplyr::mutate(normalized_value = peptide_value/protein_value,
+#                    .keep = "unused") %>%
+#   tidyr::pivot_wider(
+#     names_from = sample_name,
+#     values_from = normalized_value
+#   )
+# 
+# lung_acetyl_norm <- lung_acetyl_long %>% 
+#   dplyr::inner_join(bat_protein_long,
+#                     by = c("Accession", "sample_name")) %>% 
+#   dplyr::mutate(normalized_value = peptide_value/protein_value,
+#                    .keep = "unused") %>%
+#   tidyr::pivot_wider(
+#     names_from = sample_name,
+#     values_from = normalized_value
+#   )
+# 
+# pancreas_acetyl_norm <- pancreas_acetyl_long %>% 
+#   dplyr::inner_join(bat_protein_long,
+#                     by = c("Accession", "sample_name")) %>% 
+#   dplyr::mutate(normalized_value = peptide_value/protein_value,
+#                    .keep = "unused") %>%
+#   tidyr::pivot_wider(
+#     names_from = sample_name,
+#     values_from = normalized_value
+#   )
+# 
+# skm_acetyl_norm <- skm_acetyl_long %>% 
+#   dplyr::inner_join(bat_protein_long,
+#                     by = c("Accession", "sample_name")) %>% 
+#   dplyr::mutate(normalized_value = peptide_value/protein_value,
+#                    .keep = "unused") %>%
+#   tidyr::pivot_wider(
+#     names_from = sample_name,
+#     values_from = normalized_value
+#   )
+# 
+# spleen_acetyl_norm <- spleen_acetyl_long %>% 
+#   dplyr::inner_join(bat_protein_long,
+#                     by = c("Accession", "sample_name")) %>% 
+#   dplyr::mutate(normalized_value = peptide_value/protein_value,
+#                    .keep = "unused") %>%
+#   tidyr::pivot_wider(
+#     names_from = sample_name,
+#     values_from = normalized_value
+#   )
+# 
+# total_acetyl_norm <- total_acetyl_long %>% 
+#   dplyr::inner_join(bat_protein_long,
+#                     by = c("Accession", "sample_name")) %>% 
+#   dplyr::mutate(normalized_value = peptide_value/protein_value,
+#                    .keep = "unused") %>%
+#   tidyr::pivot_wider(
+#     names_from = sample_name,
+#     values_from = normalized_value
+#   )
+
+# combine all data frames
+# left_joins
+combo_acetyl <- bat_acetyl %>% 
+  dplyr::full_join(brain_acetyl, by = "Modifications in Master Proteins (all Sites)",
+                   keep = FALSE) %>% 
+  dplyr::full_join(heart_acetyl, by = "Modifications in Master Proteins (all Sites)",
+                   keep = FALSE) %>% 
+  dplyr::full_join(kidney_acetyl, by = "Modifications in Master Proteins (all Sites)", 
+                   keep = FALSE) %>% 
+  dplyr::full_join(liver_acetyl, by = "Modifications in Master Proteins (all Sites)",
+                   keep = FALSE) %>% 
+  dplyr::full_join(lung_acetyl, by = "Modifications in Master Proteins (all Sites)",
+                   keep = FALSE) %>%
+  dplyr::full_join(pancreas_acetyl, by = "Modifications in Master Proteins (all Sites)",
+                   keep = FALSE) %>%
+  dplyr::full_join(skm_acetyl, by = "Modifications in Master Proteins (all Sites)",
+                   keep = FALSE) %>%
+  dplyr::full_join(spleen_acetyl, by = "Modifications in Master Proteins (all Sites)",
+                   keep = FALSE) %>%
+  dplyr::select(!starts_with("Master"))
+
+# replace all NAs with 0
+combo_acetyl[is.na(combo_acetyl)] <- 0
+```
+
+### Heatmap
+```{r warning = FALSE, message = FALSE}
+# create column annotations
+my_sample_col <- data.frame(
+    sample = factor(c(rep("Brown Adipose Tissue (BAT)", 3), rep("Brain", 3), rep("Heart", 3), rep("Kidney", 3), 
+               rep("Liver", 3), rep("Lung", 3), rep("Pancreas", 3), rep("Skeletal Muscle (Skm)", 3), 
+               rep("Spleen", 3)),
+               levels = c("Brown Adipose Tissue (BAT)", "Brain",
+                          "Heart", "Kidney", "Liver", "Lung", "Pancreas", "Skeletal Muscle (Skm)", "Spleen"))
+  )
+
+rownames(my_sample_col) <- colnames(combo_acetyl[ , -1])
+
+pheatmap(mat = as.matrix(combo_acetyl[ , -1]),
+         scale = "row",
+         distance_metric_row = "correlation", 
+         cluster_cols = FALSE,  
+         agglomeration_method = "average",
+         annotation_col = my_sample_col,
+         show_colnames = FALSE,
+         main = "Heatmap of normalized acetyl peptide abundance across a range of tissues")
+```
+
+### PCA 
+```{r warning = FALSE, message = FALSE}
+# Add 'Total' samples
+combo_acetyl_total <- combo_acetyl %>% 
+                          dplyr::full_join(total_acetyl, by = "Modifications in Master Proteins (all Sites)",
+                          keep = FALSE)
+
+# replace all NAs with 0
+combo_acetyl_total[is.na(combo_acetyl_total)] <- 0
+
+combo_acetyl_total_pca <- combo_acetyl_total[-1] %>% 
+                      tidyr::drop_na() %>% 
+                      as.matrix() 
+combo_acetyl_total_pca <- t(combo_acetyl_total_pca)
+rownames(combo_acetyl_total_pca) <- c(rep("BAT", 3), rep("Brain", 3), rep("Heart", 3), rep("Kidney", 3), 
+               rep("Liver", 3), rep("Lung", 3), rep("Pancreas", 3), rep("Skm", 3), 
+               rep("Spleen", 3),
+               rep("Total", 5))
+combo_acetyl_total_res.pca <- PCA(combo_acetyl_total_pca,  graph = FALSE)
+
+# Visualize eigenvalues/variances
+fviz_screeplot(combo_acetyl_total_res.pca, addlabels = TRUE, ylim = c(0, 20))
+
+fviz_pca_ind(combo_acetyl_total_res.pca, 
+             habillage = as.factor(rownames(combo_acetyl_total_pca)),
+             repel = TRUE # Avoid text overlapping (slow if many points)
+             )
+```
+
+## Figure 4
+
+Cysteine acetylome in BAT from mice acclimated to 4⁰C compared to mice housed at RT. 
+
+### Import data
+
+```{r message = FALSE, warning = FALSE}
+# import peptide-level data
+rt_vs_fourdeg_peptide <- read_excel("Proteomics Data/All Acetyl-Cys Peptide groups _ all columns _ 20230212EKK20230126_BAT_4degVsRT_PD20230217.xlsx")
+
+# Add a unique identifier to each row
+rt_vs_fourdeg_peptide$peptide_id <- paste0("analyte_", 1:nrow(rt_vs_fourdeg_peptide))
+
+# import protein-level data
+rt_vs_fourdeg_protein <- read_excel("Protein data/All Proteins _ all columns _ 20230212EKK20230126_BAT_4degVsRT_PD20230217.xlsx")
+
+# import FULL peptide-level data
+rt_vs_fourdeg_peptide_all <- read_excel("Proteomics Data/All Peptide groups _ all columns _ 20230212EKK20230126_BAT_4degVsRT_PD20230217.xlsx")
+
+# In the case of peptide-level data, there are some peptides that match to MULTIPLE proteins
+# Decision - treat these as DIFFERENT peptides
+
+# select relevant columns and perform mean imputation by group for peptide df
+rt_vs_fourdeg_peptide <- rt_vs_fourdeg_peptide %>% 
+              dplyr::select(peptide_id, `Master Protein Accessions`, `Modifications in Master Proteins (all Sites)`, starts_with("Abundance:")) %>% 
+              dplyr::rowwise() %>% 
+              dplyr::mutate(row_means_4deg = mean(c_across(contains("4deg")), na.rm = TRUE),
+                            row_means_RT = mean(c_across(contains("RT")), na.rm = TRUE)) %>% 
+              dplyr::ungroup() %>% 
+              dplyr::mutate(across(contains("4deg"), ~ coalesce(., row_means_4deg)),
+                            across(contains("RT"), ~ coalesce(., row_means_RT))) %>% 
+              dplyr::select(-starts_with("row_means")) %>% 
+              tidyr::drop_na()
+
+# divide each column by the colsums of the FULL peptide dataframe
+# compute columns sums for "Abundance:" columns
+colsums <- rt_vs_fourdeg_peptide_all %>% 
+  dplyr::select(starts_with("Abundance:")) %>% 
+  colSums(., na.rm = TRUE)
+
+colsums_df <- data.frame(as.list(colsums))
+
+# Divide "Abundance:" columns by these colsums
+rt_vs_fourdeg_peptide <- rt_vs_fourdeg_peptide %>%
+  dplyr::rowwise() %>%
+  dplyr::mutate(c_across(starts_with("Abundance:")) / colsums_df, .keep = "unused") %>%
+  dplyr::rename_with(.cols = contains(".."), ~str_replace_all(., "\\.+", ": ")) %>% # we do this because the line above changes the sample names
+  dplyr::rename_with(.cols = starts_with("Abundance"), ~str_replace(., "Sample:", "Sample,")) %>% 
+  dplyr::ungroup()
+
+# select relevant columns and perform mean imputation by group for protein df
+rt_vs_fourdeg_protein <- rt_vs_fourdeg_protein %>% 
+                            dplyr::select(Accession, starts_with("Abundance:")) %>% 
+                            dplyr::rowwise() %>% 
+                            dplyr::mutate(row_means_4deg = mean(c_across(contains("4deg")), na.rm = TRUE),
+                                          row_means_RT = mean(c_across(contains("RT")), na.rm = TRUE)) %>% 
+                            dplyr::ungroup() %>% 
+                            dplyr::mutate(across(contains("4deg"), ~ coalesce(., row_means_4deg)),
+                                          across(contains("RT"), ~ coalesce(., row_means_RT))) %>% 
+                            dplyr::select(-starts_with("row_means")) %>% 
+                            tidyr::drop_na()
+
+# reshape peptide data frame
+rt_vs_fourdeg_peptide_long <- rt_vs_fourdeg_peptide %>%
+  tidyr::separate_longer_delim(`Master Protein Accessions`,
+                               delim = ";") %>%
+  tidyr::pivot_longer(
+    cols = starts_with("Abundance"),
+    names_to = "sample_name",
+    values_to = "peptide_value"
+  ) %>%
+  dplyr::rename(Accession = `Master Protein Accessions`) %>%
+  dplyr::mutate(Accession = str_trim(Accession))
+
+# reshape protein data frame
+rt_vs_fourdeg_protein_long <- rt_vs_fourdeg_protein %>% 
+  tidyr::pivot_longer(cols = starts_with("Abundance"),
+                      names_to = "sample_name",
+                      values_to = "protein_value")
+
+# join data frames, normalize peptide value, and reshape
+rt_vs_fourdeg_peptide_norm <- rt_vs_fourdeg_peptide_long %>% 
+  dplyr::inner_join(rt_vs_fourdeg_protein_long,
+                    by = c("Accession", "sample_name")) %>% 
+  dplyr::mutate(normalized_value = peptide_value/protein_value,
+                   .keep = "unused") %>%
+  tidyr::pivot_wider(
+    names_from = sample_name,
+    values_from = normalized_value
+  ) %>% 
+  tidyr::unite("unique_id", peptide_id:Accession) # this way every entry will be unique
+
+# Note that these are a few analytes that have 1s across all samples, indicating that in these cases the peptide and protein abundance are IDENTICAL
+ 
+# create a column called `zero_var` that identifies those rows with 0 variance i.e. all 1s
+rt_vs_fourdeg_peptide_norm <- rt_vs_fourdeg_peptide_norm %>% 
+                                  dplyr::mutate(zero_var = if_all(starts_with("Abundance:"), ~ . == 1))
+
+rt_vs_fourdeg_peptide_norm_var <- rt_vs_fourdeg_peptide_norm %>% 
+                                    dplyr::filter(!zero_var) %>% 
+                                    dplyr::select(-zero_var) %>% 
+                                    dplyr::select(-`Modifications in Master Proteins (all Sites)`)
+rt_vs_fourdeg_peptide_norm_no_var <- rt_vs_fourdeg_peptide_norm %>% 
+                                        dplyr::filter(zero_var) %>% 
+                                        dplyr::select(-zero_var) %>% 
+                                        dplyr::select(-`Modifications in Master Proteins (all Sites)`)# empty df
+
+rt_vs_fourdeg_peptide_only <- rt_vs_fourdeg_peptide %>% 
+  tidyr::separate_rows(`Master Protein Accessions`) %>% 
+  tidyr::unite("unique_id", peptide_id:`Master Protein Accessions`) %>% 
+  dplyr::filter(unique_id %in% rt_vs_fourdeg_peptide_norm_no_var$unique_id) %>% 
+  dplyr::select(-`Modifications in Master Proteins (all Sites)`)
+
+# combine data frames
+# NOTE: treat separately for limma!
+rt_vs_fourdeg_peptide_norm <- dplyr::bind_rows(rt_vs_fourdeg_peptide_norm_var,
+                                                 rt_vs_fourdeg_peptide_only)
+```
+
+### Heatmap
+
+```{r message = FALSE, warning = FALSE}
+heatmap_function(df = rt_vs_fourdeg_peptide_norm,
+                 cols = c(5,6,7,2,3,4),
+                 log_transform = FALSE,
+                 cluster_number = 6,
+                 distance_metric_row = "correlation",
+                 distance_metric_col = "correlation",
+                 agglomeration_method = "average",
+                 sample = factor(c(rep("RT", 3), rep("4deg", 3)),
+                                 levels = c("RT", "4deg"))
+                 )
+```
+
+### PCA 
+
+```{r message = FALSE, warning = FALSE}
+rt_vs_fourdeg_peptide_pca_norm <- rt_vs_fourdeg_peptide_norm[2:7] %>% 
+                                  tidyr::drop_na() %>% 
+                                  as.matrix() 
+rt_vs_fourdeg_peptide_pca_norm <- t(rt_vs_fourdeg_peptide_pca_norm)
+rownames(rt_vs_fourdeg_peptide_pca_norm) <- c(rep("4deg", 3), rep("RT", 3))
+rt_vs_fourdeg_peptide_res.pca_norm <- PCA(rt_vs_fourdeg_peptide_pca_norm,  graph = FALSE)
+
+# Visualize eigenvalues/variances
+fviz_screeplot(rt_vs_fourdeg_peptide_res.pca_norm, addlabels = TRUE, ylim = c(0, 75))
+
+fviz_pca_ind(rt_vs_fourdeg_peptide_res.pca_norm, 
+             habillage = as.factor(rownames(rt_vs_fourdeg_peptide_pca_norm)),
+             repel = TRUE # Avoid text overlapping (slow if many points)
+             )
+```
+
+### Differential Abundance Analysis
+```{r message = FALSE, warning = FALSE}
+# first on set normalized to protein levels
+# prepare matrix for limma and log2 transform
+rt_vs_fourdeg_peptide_norm_var_mat <- as.matrix(rt_vs_fourdeg_peptide_norm_var[ , -1])
+rt_vs_fourdeg_peptide_norm_var_mat <- apply(rt_vs_fourdeg_peptide_norm_var_mat, 2, log2)
+rownames(rt_vs_fourdeg_peptide_norm_var_mat) <- rt_vs_fourdeg_peptide_norm_var$unique_id
+
+# create design matrix
+rt_vs_fourdeg_group <- c(rep("4deg", 3), rep("RT", 3))
+rt_vs_fourdeg_group <- factor(rt_vs_fourdeg_group,
+                                levels = c("RT", "4deg"))
+rt_vs_fourdeg_design <- model.matrix(~rt_vs_fourdeg_group)
+colnames(rt_vs_fourdeg_design) <- c("RT_mean", "4deg_vs_RT")
+
+# fit model
+rt_vs_fourdeg_peptide_norm_var_mat_fit <- limma::lmFit(rt_vs_fourdeg_peptide_norm_var_mat, rt_vs_fourdeg_design)
+rt_vs_fourdeg_peptide_norm_var_mat_efit <- limma::eBayes(rt_vs_fourdeg_peptide_norm_var_mat_fit)
+
+# combine results
+# note: here we're not combining anything because there are no "no var" analytes, unlike with the other rt_vs_4deg analysis
+# however, the object names are kept the same for simplicity
+rt_vs_fourdeg_combo <- topTable(rt_vs_fourdeg_peptide_norm_var_mat_efit, 
+         coef = "4deg_vs_RT",
+         number = nrow(rt_vs_fourdeg_peptide_norm_var_mat)) %>% 
+  data.frame() %>% 
+  tibble::rownames_to_column("unique_id") %>% 
+  dplyr::mutate(unique_id = str_replace(unique_id, "(?<=\\d)_(?=\\w)", "-")) %>% 
+  dplyr::mutate(unique_id = str_replace(unique_id, "(?<=\\d)-(?=\\d)", "_"))
+  
+# convert to proper name format
+# e.g. MDH1-C123
+protein_site <- read_excel("Proteomics Data/All Acetyl-Cys Peptide groups _ all columns _ 20230212EKK20230126_BAT_4degVsRT_PD20230217.xlsx")
+  
+protein_site$peptide_id <- paste0("analyte_", 1:nrow(protein_site))
+
+protein_site <- protein_site %>% 
+  tidyr::separate_longer_delim(`Master Protein Accessions`,
+                               delim = ";") %>%
+  tidyr::separate_longer_delim(`Modifications in Master Proteins (all Sites)`,
+                               delim = "];") %>%
+  dplyr::rename(Accession = `Master Protein Accessions`) %>%
+  dplyr::mutate(Accession = str_trim(Accession)) %>%
+  dplyr::mutate(`Modifications in Master Proteins (all Sites)` = str_trim(`Modifications in Master Proteins (all Sites)`,
+                                     side = "left")) %>%
+  dplyr::mutate(`Modifications in Master Proteins (all Sites)` = paste0(`Modifications in Master Proteins (all Sites)`, "]")) %>% 
+  # adding closing square bracked to those residues that are missing it. 
+  dplyr::mutate(`Modifications in Master Proteins (all Sites)` = str_replace(`Modifications in Master Proteins (all Sites)`, "\\]\\]", "\\]")) %>% 
+  # now everything looks good!
+  dplyr::mutate(protein_residue = word(`Modifications in Master Proteins (all Sites)`)) %>% 
+  dplyr::filter(Accession == protein_residue) %>% 
+  dplyr::select(peptide_id, Accession, `Modifications in Master Proteins (all Sites)`) %>% 
+  dplyr::rename(Modification = `Modifications in Master Proteins (all Sites)`) %>% 
+  dplyr::mutate(Modification = str_extract(Modification, "(\\[).+(\\])")) %>%  # pull out anything between square bracket
+  dplyr::mutate(Modification = str_remove_all(Modification, "(?<=\\]).+")) %>% # only keep things inside square brackets
+  tidyr::unite("unique_id", peptide_id:Accession, sep = "-", remove = FALSE) %>% 
+  dplyr::mutate(unique_id = str_replace(unique_id, "(?<=\\d)-(?=\\d)", "_"))
+
+protein_site <- biomaRt::select(org.Mm.eg.db, protein_site$Accession, "SYMBOL", "UNIPROT") %>% 
+  tibble::tibble() %>% 
+  dplyr::inner_join(protein_site, by = c("UNIPROT" = "Accession")) %>% 
+  dplyr::mutate(SYMBOL = str_to_upper(SYMBOL)) %>% 
+  tidyr::unite("protein_mod", c(SYMBOL, Modification), sep = "-") %>% 
+  dplyr::mutate(protein_mod = if_else(str_detect(protein_mod, "^NA"),
+                                      NA,
+                                      protein_mod)) %>% 
+  dplyr::select(unique_id, protein_mod)
+
+# join
+rt_vs_fourdeg_combo_join <- rt_vs_fourdeg_combo %>% 
+  dplyr::inner_join(protein_site, by = "unique_id") %>% 
+  dplyr::distinct()
+
+# save results
+# write_csv(rt_vs_fourdeg_combo_join, "results/rt_vs_4deg_mean_imputation_limma.csv")
+# last saved on 04/14/2024
+
+rt_vs_fourdeg_combo_join %>% 
+  dplyr::mutate(protein_mod = str_remove(protein_mod, "-\\[.+")) %>% 
+  ggplot(aes(logFC, -log10(adj.P.Val))) +
+  geom_point(col = "grey") +
+  geom_vline(xintercept = -2, linetype = 2) +
+  geom_vline(xintercept = 2, linetype = 2) +
+  geom_hline(yintercept = -log10(0.05), linetype = 3) +
+  geom_vline(xintercept = 0, linetype = 1) +
+  geom_hline(yintercept = 0, linetype = 1) +
+  geom_point(data = . %>% filter(logFC > 2 & adj.P.Val < 0.05), col = "red") +
+  geom_point(data = . %>% filter(logFC < -2 & adj.P.Val < 0.05), col = "blue") +
+  geom_text_repel(data = . %>% filter(logFC > 2 & adj.P.Val < 0.05), aes(label = protein_mod),
+            vjust = -1, hjust = 1) +
+  geom_text_repel(data = . %>% filter(logFC < -2 & adj.P.Val < 0.05), aes(label = protein_mod),
+            vjust = -1, hjust = -0.1) +
+  labs(title = "4deg vs RT") +
+  theme_bw()
+
+# visualize abundance of top analytes
+rt_vs_fourdeg_peptide_norm %>% 
+  dplyr::mutate(unique_id = str_replace(unique_id, "(?<=\\d)_(?=\\w)", "-")) %>% 
+  dplyr::mutate(unique_id = str_replace(unique_id, "(?<=\\d)-(?=\\d)", "_")) %>% 
+  dplyr::inner_join(protein_site, by = "unique_id") %>% 
+  dplyr::select(-unique_id) %>%
+  tidyr::pivot_longer(cols = -protein_mod,
+                      names_to = "sample",
+                      values_to = "abundance") %>% 
+  dplyr::filter(protein_mod == "GAPDH-[K143; C150]") %>% 
+  dplyr::mutate(treatment = if_else(str_detect(sample, "4deg"),
+                                    "4deg",
+                                    "RT"),
+                treatment = factor(treatment),
+                log_abundance = log2(abundance)) %>% 
+  ggplot(aes(treatment, log_abundance, col = treatment)) +
+  geom_point() +
+  labs(title = "Analyte: GAPDH-[K143; C150]") +
+  theme_bw()
+```
+
+### Pathway Analysis
+```{r message = FALSE, warning = FALSE}
+rt_vs_fourdeg_peptide_norm_fgsea <- topTable(rt_vs_fourdeg_peptide_norm_var_mat_efit, 
+         coef = "4deg_vs_RT",
+         number = nrow(rt_vs_fourdeg_peptide_norm_var_mat)) %>% 
+  data.frame() %>% 
+  tibble::rownames_to_column("unique_id") %>% 
+  dplyr::select(unique_id, t) %>%
+  dplyr::distinct() %>% 
+  dplyr::mutate(unique_id = str_replace(unique_id, "(?<=\\d)_(?=\\w)", "-")) %>% 
+  tidyr::separate_wider_delim(unique_id,
+                              delim = "-",
+                              names = c("analyte_id", "UNIPROT")) %>% 
+  dplyr::select(UNIPROT, t) %>%
+  dplyr::group_by(UNIPROT) %>% 
+  dplyr::summarise(mean_t = mean(t))
+
+# convert Uniprot IDs to Entrez IDs
+# https://www.biostars.org/p/399332/
+
+rt_vs_fourdeg_peptide_norm_entrez <- select(org.Mm.eg.db, rt_vs_fourdeg_peptide_norm_fgsea$UNIPROT, "ENTREZID", "UNIPROT")
+
+# join
+rt_vs_fourdeg_peptide_norm_entrez_ranks <- rt_vs_fourdeg_peptide_norm_fgsea %>% 
+                          dplyr::inner_join(rt_vs_fourdeg_peptide_norm_entrez, by = "UNIPROT") %>% 
+                          dplyr::select(ENTREZID, mean_t) %>% 
+                          dplyr::arrange(desc(mean_t)) %>% 
+                          tidyr::drop_na()
+
+rt_vs_fourdeg_peptide_norm_entrez_ranks <- deframe(rt_vs_fourdeg_peptide_norm_entrez_ranks)
+
+# gmt file obtained from - 
+# https://data.broadinstitute.org/gsea-msigdb/msigdb/release/2023.1.Mm/
+
+pathways.mh.all.v2023 <- gmtPathways("metadata/mh.all.v2023.1.Mm.entrez.gmt.txt")
+
+set.seed(42)
+fgseaRes_rt_vs_fourdeg_peptide_norm <- fgseaMultilevel(pathways = pathways.mh.all.v2023, 
+                                            stats = rt_vs_fourdeg_peptide_norm_entrez_ranks)
+
+fgseaResTidy_rt_vs_fourdeg_peptide_norm  <- fgseaRes_rt_vs_fourdeg_peptide_norm %>%
+                                    tibble::as_tibble() %>%
+                                    dplyr::arrange(padj)
+# save results
+# write_csv(fgseaResTidy_rt_vs_fourdeg_peptide_norm, "results/rt_vs_4deg_fgsea_results_mean_imputation.csv")
+```
+
+### GSEA plot for `HALLMARK_ADIPOGENESIS`
+```{r message = FALSE, warning = FALSE}
+# gsea plot for Hallmark Adipogensis (the top pathway)
+plotEnrichment(pathways.mh.all.v2023[["HALLMARK_ADIPOGENESIS"]],
+               rt_vs_fourdeg_peptide_norm_entrez_ranks) +
+  labs(title = "Adipogenesis")
+```
+
+### GSEA plot for `HALLMARK_FATTY_ACID_METABOLISM`
+```{r message = FALSE, warning = FALSE}
+plotEnrichment(pathways.mh.all.v2023[["HALLMARK_FATTY_ACID_METABOLISM"]],
+               rt_vs_fourdeg_peptide_norm_entrez_ranks) +
+  labs(title = "Fatty Acid Metabolism")
+```
+
+### GSEA plot for `HALLMARK_OXIDATIVE_PHOSPHORYLATION`
+```{r message = FALSE, warning = FALSE}
+plotEnrichment(pathways.mh.all.v2023[["HALLMARK_OXIDATIVE_PHOSPHORYLATION"]],
+               rt_vs_fourdeg_peptide_norm_entrez_ranks) +
+  labs(title = "Oxidative Phosphorylation")
+```
+
+## Figure S1
+
+Incubation with Acetyl-CoA increases cysteine acetylation. 
+
+### Import data
+
+```{r message = FALSE, warning = FALSE}
+liver_acetyl_peptide <- read_excel("Proteomics Data/All Acetyl-Cys Peptide groups _ all columns _ 20221220EKK20220908_Liver+AcetylCoA_PD20220112.xlsx")
+
+# Add a unique identifier to each row
+liver_acetyl_peptide$peptide_id <- paste0("analyte_", 1:nrow(liver_acetyl_peptide))
+
+# import protein-level data
+liver_acetyl_protein <- read_excel("Protein data/All Proteins _ all columns _ 20221220EKK20220908_Liver+AcetylCoA_PD20220112.xlsx")
+
+# In the case of peptide-level data, there are some peptides that match to MULTIPLE proteins
+# Decision - treat these as DIFFERENT peptides
+
+# select relevant columns 
+liver_acetyl_peptide <- liver_acetyl_peptide %>% 
+                            dplyr::select(peptide_id, `Master Protein Accessions`, starts_with("Abundances (Normalized)")) %>% 
+                            tidyr::drop_na()
+
+# reshape data frame
+liver_acetyl_peptide_long <- liver_acetyl_peptide %>%
+  tidyr::separate_longer_delim(`Master Protein Accessions`,
+                               delim = ";") %>%
+  tidyr::pivot_longer(
+    cols = starts_with("Abundance"),
+    names_to = "sample_name",
+    values_to = "peptide_value"
+  ) %>%
+  dplyr::rename(Accession = `Master Protein Accessions`) %>%
+  dplyr::mutate(Accession = str_trim(Accession))
+
+# select relevant columns
+liver_acetyl_protein <- liver_acetyl_protein %>% 
+                            dplyr::select(Accession, starts_with("Abundances (Normalized)")) %>% 
+                            tidyr::drop_na()
+
+# reshape data frame
+liver_acetyl_protein_long <- liver_acetyl_protein %>% 
+  tidyr::pivot_longer(cols = starts_with("Abundance"),
+                      names_to = "sample_name",
+                      values_to = "protein_value") 
+
+# join data frames, normalize peptide value, and reshape
+liver_acetyl_peptide_norm <- liver_acetyl_peptide_long %>% 
+  dplyr::inner_join(liver_acetyl_protein_long,
+                    by = c("Accession", "sample_name")) %>%
+  dplyr::mutate(normalized_value = peptide_value/protein_value,
+                   .keep = "unused") %>% 
+  dplyr::distinct(peptide_id, Accession, sample_name, 
+                  .keep_all = TRUE) %>% # NOTE: if you don't do this, you end up with list columns because of non-unique rows!!
+  # This is likely happening because of too many many-to-many matches
+  tidyr::pivot_wider(
+    names_from = sample_name,
+    values_from = normalized_value
+  ) %>% 
+  tidyr::unite("unique_id", peptide_id:Accession) %>%  # this way every entry will be unique
+  dplyr::select(unique_id, contains("TCEP"))
+# Note that these are a few analytes that have 1s across all samples, indicating that in these cases the peptide and protein abundance are IDENTICAL
+ 
+# create a column called `zero_var` that identifies those rows with 0 variance i.e. all 1s
+liver_acetyl_peptide_norm <- liver_acetyl_peptide_norm %>% 
+                                  dplyr::mutate(zero_var = if_all(starts_with("Abundances"), ~ . == 1))
+
+liver_acetyl_peptide_norm_var <- liver_acetyl_peptide_norm %>% 
+                                    dplyr::filter(!zero_var) %>% 
+                                    dplyr::select(-zero_var)
+liver_acetyl_peptide_norm_no_var <- liver_acetyl_peptide_norm %>% 
+                                        dplyr::filter(zero_var) %>% 
+                                        dplyr::select(-zero_var)
+
+liver_acetyl_peptide_only <- liver_acetyl_peptide %>% 
+  tidyr::separate_rows(`Master Protein Accessions`) %>% 
+  tidyr::unite("unique_id", peptide_id:`Master Protein Accessions`) %>% 
+  dplyr::filter(unique_id %in% liver_acetyl_peptide_norm_no_var$unique_id)
+
+# combine data frames
+# NOTE: treat separately for limma!
+liver_acetyl_peptide_norm <- dplyr::bind_rows(liver_acetyl_peptide_norm_var,
+                                              liver_acetyl_peptide_only)
+```
+
+### Heatmap
+
+```{r message = FALSE, warning = FALSE}
+heatmap_function(df = liver_acetyl_peptide_norm,
+                 cols = c(3, 4, 2),
+                 log_transform = FALSE,
+                 cluster_number = 3,
+                 distance_metric_row = "correlation",
+                 distance_metric_col = "correlation",
+                 agglomeration_method = "average",
+                 cluster_cols = FALSE,
+                 sample = c("10 mM", "1 mM", "0 mM"))
+```
