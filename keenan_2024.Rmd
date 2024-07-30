@@ -1535,6 +1535,30 @@ plotEnrichment(pathways.mh.all.v2023[["HALLMARK_OXIDATIVE_PHOSPHORYLATION"]],
   labs(title = "Oxidative Phosphorylation")
 ```
 
+### Pull out leading edge genes for `HALLMARK_ADIPOGENESIS`, `HALLMARK_FATTY_ACID_METABOLISM`, and `HALLMARK_OXIDATIVE_PHOSPHORYLATION`
+```{r message = FALSE, warning = FALSE}
+# `HALLMARK_ADIPOGENESIS`
+fgseaResTidy_rt_vs_fourdeg_peptide_norm[fgseaResTidy_rt_vs_fourdeg_peptide_norm$pathway == "HALLMARK_ADIPOGENESIS", ]$leadingEdge
+# "11429" "11770"
+rt_vs_fourdeg_peptide_norm_entrez[rt_vs_fourdeg_peptide_norm_entrez$ENTREZID %in% 
+                                    c("11429", "11770"), ]$UNIPROT
+# "P04117" "Q99KI0"
+
+# `HALLMARK_FATTY_ACID_METABOLISM`
+fgseaResTidy_rt_vs_fourdeg_peptide_norm[fgseaResTidy_rt_vs_fourdeg_peptide_norm$pathway == "HALLMARK_FATTY_ACID_METABOLISM", ]$leadingEdge
+# "11429" "16852" "72479"
+rt_vs_fourdeg_peptide_norm_entrez[rt_vs_fourdeg_peptide_norm_entrez$ENTREZID %in% 
+                                    c("11429", "16852", "72479"), ]$UNIPROT
+# "P16045" "Q2TPA8" "Q99KI0"
+
+# `HALLMARK_OXIDATIVE_PHOSPHORYLATION`
+fgseaResTidy_rt_vs_fourdeg_peptide_norm[fgseaResTidy_rt_vs_fourdeg_peptide_norm$pathway == "HALLMARK_OXIDATIVE_PHOSPHORYLATION", ]$leadingEdge
+# "11429" "97212"
+rt_vs_fourdeg_peptide_norm_entrez[rt_vs_fourdeg_peptide_norm_entrez$ENTREZID %in% 
+                                    c("11429", "97212"), ]$UNIPROT
+# "Q8BMS1" "Q99KI0"
+```
+
 ## Figure S1
 
 Incubation with Acetyl-CoA increases cysteine acetylation. 
