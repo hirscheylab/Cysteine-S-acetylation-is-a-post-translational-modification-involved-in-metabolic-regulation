@@ -1554,7 +1554,7 @@ rt_vs_sixdeg_combo <- topTable(rt_vs_sixdeg_peptide_norm_var_mat_efit,
   
 # convert to proper name format
 # e.g. MDH1-C123
-protein_site <- read_excel("Proteomics Data/All Acetyl-Cys Peptide groups _ all columns _ 20230212EKK20230126_BAT_6degVsRT_PD20230217.xlsx")
+protein_site <- read_excel("Proteomics Data/All Acetyl-Cys Peptide groups _ all columns _ 20230212EKK20230126_BAT_4degVsRT_PD20230217.xlsx")
   
 protein_site$peptide_id <- paste0("analyte_", 1:nrow(protein_site))
 
@@ -1623,7 +1623,7 @@ rt_vs_sixdeg_peptide_norm %>%
                       names_to = "sample",
                       values_to = "abundance") %>% 
   dplyr::filter(protein_mod == "GAPDH-[K143; C150]") %>% 
-  dplyr::mutate(treatment = if_else(str_detect(sample, "6deg"),
+  dplyr::mutate(treatment = if_else(str_detect(sample, "4deg"),
                                     "6deg",
                                     "RT"),
                 treatment = factor(treatment),
